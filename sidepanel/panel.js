@@ -1,0 +1,676 @@
+import { PluginManager } from "./core/plugin-manager.js";
+import { DownloadEngine } from "./core/download-engine.js";
+import { HaitenHlsPlugin } from "./plugins/haiten-hls.plugin.js";
+
+const pluginManager = new PluginManager();
+pluginManager.register(HaitenHlsPlugin);
+
+let currentTabId = null;
+let standardizedList = [];   // Chỉ chứa video của Tab đang mở
+let downloadQueue = [];      // Hàng chờ tải (không bị mất khi chuyển tab)
+let activeDownloadsCount = 0;
+let sessionCompleted = [];   // Lịch sử đã tải trong phiên
+let customTitles = {};       // Tên video tùy chỉnh theo stream.id
+let savedDirHandle = null;
+
+const defaultSettings = {
+  forceTs: false,
+  notify: true,
+  saveAs: true,
+  maxVideos: 2,
+  concurrency: 8,
+  prefQuality: "highest",
+  subdir: ""
+};
+let appSettings = { ...defaultSettings };
+
+// --- ĐỊNH DẠNG THỜI GIAN ---
+function formatDuration(ms) {
+  const totalSec = ms / 1000;
+  if (totalSec < 60) return `${totalSec.toFixed(1)}s`;
+  const mins = Math.floor(totalSec / 60);
+  const secs = Math.round(totalSec % 60);
+  return `${mins}m ${secs < 10 ? "0" : ""}${secs}s`;
+}
+
+function formatTimestamp(dateObj) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(dateObj.getHours())}:${pad(dateObj.getMinutes())}:${pad(dateObj.getSeconds())} ${pad(dateObj.getDate())}/${pad(dateObj.getMonth() + 1)}`;
+}
+
+// --- INDEXED-DB LƯU DIRECTORY HANDLE ---
+function openHandleDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open("XDownloaderDirDB", 1);
+    req.onupgradeneeded = (e) => e.target.result.createObjectStore("handles");
+    req.onsuccess = (e) => resolve(e.target.result);
+    req.onerror = (e) => reject(e.target.error);
+  });
+}
+
+async function saveDirHandle(handle) {
+  const db = await openHandleDB();
+  const tx = db.transaction("handles", "readwrite");
+  tx.objectStore("handles").put(handle, "defaultDir");
+}
+
+async function loadDirHandle() {
+  try {
+    const db = await openHandleDB();
+    return await new Promise((resolve) => {
+      const tx = db.transaction("handles", "readonly");
+      const req = tx.objectStore("handles").get("defaultDir");
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => resolve(null);
+    });
+  } catch (_) {
+    return null;
+  }
+}
+
+async function clearDirHandle() {
+  const db = await openHandleDB();
+  const tx = db.transaction("handles", "readwrite");
+  tx.objectStore("handles").delete("defaultDir");
+}
+
+// --- KHỞI TẠO ---
+document.addEventListener("DOMContentLoaded", async () => {
+  await loadSettings();
+  await loadSessionCompleted();
+  savedDirHandle = await loadDirHandle();
+  updateDirStatusUI();
+
+  bindNavigationAndSettings();
+  fetchActiveTabMedia();
+
+  // Lắng nghe khi người dùng chuyển tab hoặc có video mới trong tab hiện tại
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message.type === "TAB_MEDIA_UPDATED") {
+      currentTabId = message.tabId;
+      updateFromRaw(message.data || []);
+    }
+  });
+
+  // Cập nhật bộ đếm giây trực tiếp cho các video đang tải trong Queue
+  setInterval(() => {
+    downloadQueue.forEach((task) => {
+      if (task.status === "downloading" && task.startedAt) {
+        const el = document.getElementById(`q-timer-${task.queueId}`);
+        if (el) el.innerText = `⏱ ${formatDuration(Date.now() - task.startedAt)}`;
+      }
+    });
+  }, 500);
+});
+
+async function loadSettings() {
+  const res = await chrome.storage.local.get("xDownloaderSettings");
+  if (res.xDownloaderSettings) {
+    appSettings = { ...defaultSettings, ...res.xDownloaderSettings };
+  }
+  document.getElementById("setForceTs").checked = appSettings.forceTs;
+  document.getElementById("setNotify").checked = appSettings.notify;
+  document.getElementById("setSaveAs").checked = appSettings.saveAs;
+  document.getElementById("setMaxVideos").value = appSettings.maxVideos;
+  document.getElementById("setConcurrency").value = appSettings.concurrency;
+  document.getElementById("setSubdir").value = appSettings.subdir;
+
+  const radio = document.querySelector(`input[name="prefQuality"][value="${appSettings.prefQuality}"]`);
+  if (radio) radio.checked = true;
+}
+
+function saveSettings() {
+  appSettings.forceTs = document.getElementById("setForceTs").checked;
+  appSettings.notify = document.getElementById("setNotify").checked;
+  appSettings.saveAs = document.getElementById("setSaveAs").checked;
+  appSettings.maxVideos = Math.max(1, parseInt(document.getElementById("setMaxVideos").value, 10) || 2);
+  appSettings.concurrency = Math.max(1, parseInt(document.getElementById("setConcurrency").value, 10) || 8);
+  appSettings.subdir = document.getElementById("setSubdir").value.trim();
+
+  const checkedRadio = document.querySelector('input[name="prefQuality"]:checked');
+  if (checkedRadio) appSettings.prefQuality = checkedRadio.value;
+
+  chrome.storage.local.set({ xDownloaderSettings: appSettings });
+  renderStreams();
+  processQueue();
+}
+
+async function loadSessionCompleted() {
+  const res = await chrome.storage.session.get("completedDownloads");
+  sessionCompleted = res.completedDownloads || [];
+  renderCompletedList();
+}
+
+async function saveSessionCompleted() {
+  await chrome.storage.session.set({ completedDownloads: sessionCompleted });
+  renderCompletedList();
+}
+
+function updateDirStatusUI() {
+  const el = document.getElementById("customDirStatus");
+  if (savedDirHandle) {
+    el.innerText = `Đường dẫn trực tiếp: "${savedDirHandle.name}"`;
+  } else {
+    el.innerText = "Đường dẫn trực tiếp: Dùng mặc định trình duyệt";
+  }
+}
+
+function bindNavigationAndSettings() {
+  const mainView = document.getElementById("mainView");
+  const settingsView = document.getElementById("settingsView");
+  const toggleSettingsBtn = document.getElementById("toggleSettingsBtn");
+
+  toggleSettingsBtn.addEventListener("click", () => {
+    const isShowingSettings = !settingsView.classList.contains("hidden");
+    settingsView.classList.toggle("hidden", isShowingSettings);
+    mainView.classList.toggle("hidden", !isShowingSettings);
+    toggleSettingsBtn.classList.toggle("active", !isShowingSettings);
+  });
+
+  document.getElementById("backToMainBtn").addEventListener("click", () => {
+    settingsView.classList.add("hidden");
+    mainView.classList.remove("hidden");
+    toggleSettingsBtn.classList.remove("active");
+  });
+
+  ["setForceTs", "setNotify", "setSaveAs", "setMaxVideos", "setConcurrency", "setSubdir"].forEach(id => {
+    document.getElementById(id).addEventListener("change", saveSettings);
+  });
+  document.querySelectorAll('input[name="prefQuality"]').forEach(r => {
+    r.addEventListener("change", saveSettings);
+  });
+
+  document.getElementById("pickCustomDirBtn").addEventListener("click", async () => {
+    try {
+      const handle = await window.showDirectoryPicker({ mode: "readwrite" });
+      savedDirHandle = handle;
+      await saveDirHandle(handle);
+      updateDirStatusUI();
+    } catch (_) {}
+  });
+
+  document.getElementById("clearCustomDirBtn").addEventListener("click", async () => {
+    savedDirHandle = null;
+    await clearDirHandle();
+    updateDirStatusUI();
+  });
+
+  document.getElementById("openChromeDlSettingsBtn").addEventListener("click", () => {
+    chrome.tabs.create({ url: "chrome://settings/downloads" });
+  });
+
+  document.getElementById("openFolderBtn").addEventListener("click", () => {
+    chrome.downloads.showDefaultFolder();
+  });
+
+  document.getElementById("clearAllMediaBtn").addEventListener("click", () => {
+    if (!currentTabId) return;
+    chrome.runtime.sendMessage({ type: "CLEAR_ACTIVE_TAB_MEDIA", tabId: currentTabId }, () => {
+      standardizedList = [];
+      renderStreams();
+    });
+  });
+
+  document.getElementById("toggleCompleteBtn").addEventListener("click", (e) => {
+    const listEl = document.getElementById("completeList");
+    const isHidden = listEl.classList.toggle("hidden");
+    e.target.innerText = isHidden ? "show all" : "hide";
+  });
+
+  document.getElementById("clearCompleteBtn").addEventListener("click", async () => {
+    sessionCompleted = [];
+    await saveSessionCompleted();
+  });
+}
+
+function fetchActiveTabMedia() {
+  chrome.runtime.sendMessage({ type: "GET_ACTIVE_TAB_MEDIA" }, (res) => {
+    if (res) {
+      currentTabId = res.tabId;
+      updateFromRaw(res.data || []);
+    }
+  });
+}
+
+function updateFromRaw(rawList) {
+  standardizedList = pluginManager.normalizeAll(rawList);
+  renderStreams();
+}
+
+function pickPreferredVariantIndex(variants) {
+  if (!variants || variants.length === 0) return 0;
+  if (appSettings.prefQuality === "highest") return 0;
+  const targetH = parseInt(appSettings.prefQuality, 10);
+  let bestIdx = 0;
+  let minDiff = Infinity;
+  variants.forEach((v, idx) => {
+    if (v.height) {
+      const diff = Math.abs(v.height - targetH);
+      if (diff < minDiff) {
+        minDiff = diff;
+        bestIdx = idx;
+      }
+    }
+  });
+  return bestIdx;
+}
+
+// --- HIỂN THỊ DANH SÁCH VIDEO CỦA TAB HIỆN TẠI ---
+function renderStreams() {
+  const container = document.getElementById("mediaContainer");
+  if (!standardizedList || standardizedList.length === 0) {
+    container.innerHTML = `<div style="text-align:center; color:#909296; margin: 24px 0; font-size:12px;">No videos found in this tab.</div>`;
+    return;
+  }
+
+  container.innerHTML = "";
+  const defaultFmt = appSettings.forceTs ? "ts" : "mp4";
+
+  standardizedList.forEach((stream, sIdx) => {
+    const prefVIdx = pickPreferredVariantIndex(stream.variants);
+    const activeVariant = stream.variants[prefVIdx] || stream.variants[0];
+    const displayTitle = customTitles[stream.id] || stream.title || "Video";
+
+    const qualityOptions = stream.variants
+      .map((v, idx) => `<option value="${idx}" ${idx === prefVIdx ? "selected" : ""}>${v.label}</option>`)
+      .join("");
+
+    const card = document.createElement("div");
+    card.className = "media-card";
+    card.innerHTML = `
+      <div class="thumb-box">
+        <span id="res-label-${sIdx}">${activeVariant.label}</span>
+        <span class="size-badge" id="size-badge-${sIdx}">${activeVariant.sizeText}</span>
+      </div>
+      <div class="card-body">
+        <div>
+          <div class="title-row">
+            <div class="title-wrap">
+              <span class="proto-badge">${stream.pluginName}</span>
+              <span id="title-text-${sIdx}">${displayTitle}</span>.<span id="ext-label-${sIdx}">${defaultFmt}</span>
+            </div>
+            <button class="btn-close" id="remove-${sIdx}" title="Remove from tab.">&times;</button>
+          </div>
+          <div class="edit-row" id="edit-row-${sIdx}">
+            <button class="btn-icon-inline" id="edit-btn-${sIdx}" title="Rename file">✎</button>
+          </div>
+        </div>
+
+        <div class="action-row">
+          <div class="select-group">
+            <select class="dark-select" id="fmt-${sIdx}" title="Format">
+              <option value="mp4" ${defaultFmt === "mp4" ? "selected" : ""}>MP4</option>
+              <option value="ts" ${defaultFmt === "ts" ? "selected" : ""}>TS</option>
+            </select>
+            <select class="dark-select" id="var-${sIdx}" title="Resolution">
+              ${qualityOptions}
+            </select>
+          </div>
+          <button class="btn-download-pill" id="dl-btn-${sIdx}">
+            <span>Download</span>
+          </button>
+        </div>
+      </div>
+    `;
+    container.appendChild(card);
+
+    const fmtSelect = card.querySelector(`#fmt-${sIdx}`);
+    const varSelect = card.querySelector(`#var-${sIdx}`);
+    const extLabel = card.querySelector(`#ext-label-${sIdx}`);
+    const resLabel = card.querySelector(`#res-label-${sIdx}`);
+    const sizeBadge = card.querySelector(`#size-badge-${sIdx}`);
+
+    fmtSelect.addEventListener("change", () => {
+      extLabel.innerText = fmtSelect.value;
+    });
+
+    varSelect.addEventListener("change", () => {
+      const v = stream.variants[parseInt(varSelect.value, 10)];
+      if (v) {
+        resLabel.innerText = v.label;
+        sizeBadge.innerText = v.sizeText;
+      }
+    });
+
+    card.querySelector(`#edit-btn-${sIdx}`).addEventListener("click", () => {
+      const editRow = card.querySelector(`#edit-row-${sIdx}`);
+      const currentName = customTitles[stream.id] || stream.title;
+      editRow.innerHTML = `<input type="text" class="rename-input" id="rename-inp-${sIdx}" value="${currentName}">`;
+      const inp = editRow.querySelector(`#rename-inp-${sIdx}`);
+      inp.focus();
+      inp.select();
+
+      const commitRename = () => {
+        const cleaned = inp.value
+          .replace(/\.(mp4|ts|mkv|webm|m3u8)$/i, "")
+          .replace(/[\\/:*?"<>|]/g, " - ")
+          .trim() || stream.title;
+        customTitles[stream.id] = cleaned;
+        card.querySelector(`#title-text-${sIdx}`).innerText = cleaned;
+        editRow.innerHTML = `<button class="btn-icon-inline" id="edit-btn-${sIdx}" title="Rename file">✎</button>`;
+        editRow.querySelector(`#edit-btn-${sIdx}`).addEventListener("click", () => renderStreams());
+      };
+
+      inp.addEventListener("blur", commitRename);
+      inp.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") commitRename();
+      });
+    });
+
+    card.querySelector(`#remove-${sIdx}`).addEventListener("click", () => {
+      chrome.runtime.sendMessage({
+        type: "REMOVE_RAW_ITEM",
+        tabId: currentTabId,
+        blobUrl: stream.id
+      }, (updatedRaw) => {
+        updateFromRaw(updatedRaw || []);
+      });
+    });
+
+    card.querySelector(`#dl-btn-${sIdx}`).addEventListener("click", () => {
+      const vIdx = parseInt(varSelect.value, 10);
+      const targetFormat = fmtSelect.value;
+      const finalTitle = customTitles[stream.id] || stream.title || "Video";
+
+      enqueueDownload({
+        stream,
+        variant: stream.variants[vIdx],
+        targetFormat,
+        title: finalTitle,
+        isRedownload: false,
+        historyId: null
+      });
+    });
+  });
+}
+
+// --- QUẢN LÝ HÀNG CHỜ TẢI (QUEUE) CỐ ĐỊNH KHI CHUYỂN TAB ---
+function enqueueDownload({ stream, variant, targetFormat, title, isRedownload = false, historyId = null }) {
+  const queueId = "q_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
+  downloadQueue.push({
+    queueId,
+    stream,
+    variant,
+    targetFormat,
+    title,
+    isRedownload,
+    historyId,
+    status: "queued",
+    progress: 0,
+    doneSegs: 0,
+    totalSegs: variant.segments.length,
+    startedAt: null
+  });
+
+  renderQueue();
+  processQueue();
+}
+
+function renderQueue() {
+  const section = document.getElementById("queueSection");
+  const listEl = document.getElementById("queueList");
+
+  if (downloadQueue.length === 0) {
+    section.classList.add("hidden");
+    listEl.innerHTML = "";
+    return;
+  }
+
+  section.classList.remove("hidden");
+  listEl.innerHTML = "";
+
+  downloadQueue.forEach((task) => {
+    const isDl = task.status === "downloading";
+    const statusLabel = isDl
+      ? `downloading: ${task.doneSegs}/${task.totalSegs} (${task.progress}%)`
+      : "in queue...";
+    const elapsedText = isDl && task.startedAt
+      ? `⏱ ${formatDuration(Date.now() - task.startedAt)}`
+      : "⏱ 0.0s";
+
+    const card = document.createElement("div");
+    card.className = "media-card in-queue";
+    card.id = `q-card-${task.queueId}`;
+    card.innerHTML = `
+      <div class="thumb-box">
+        <span>${task.variant.label}</span>
+        <span class="size-badge">${task.variant.sizeText}</span>
+      </div>
+      <div class="card-body">
+        <div class="title-row">
+          <div class="title-wrap">
+            <span class="queue-badge">${task.isRedownload ? "RE-DL" : "QUEUE"}</span>
+            <span>${task.title}.${task.targetFormat}</span>
+          </div>
+        </div>
+        <div>
+          <div class="queue-status-row">
+            <span id="q-status-${task.queueId}">${statusLabel}</span>
+            <span id="q-timer-${task.queueId}">${elapsedText}</span>
+          </div>
+          <div class="progress-track">
+            <div class="progress-bar-fill" id="q-fill-${task.queueId}" style="width: ${task.progress}%;"></div>
+          </div>
+        </div>
+      </div>
+    `;
+    listEl.appendChild(card);
+  });
+}
+
+function processQueue() {
+  while (activeDownloadsCount < appSettings.maxVideos) {
+    const nextTask = downloadQueue.find(t => t.status === "queued");
+    if (!nextTask) break;
+
+    nextTask.status = "downloading";
+    nextTask.startedAt = Date.now();
+    activeDownloadsCount++;
+    renderQueue();
+
+    runQueueTask(nextTask).finally(() => {
+      activeDownloadsCount--;
+      downloadQueue = downloadQueue.filter(t => t.queueId !== nextTask.queueId);
+      renderQueue();
+      processQueue();
+    });
+  }
+}
+
+async function runQueueTask(task) {
+  try {
+    const { blob, ext } = await DownloadEngine.downloadAndBuild({
+      segments: task.variant.segments,
+      concurrency: appSettings.concurrency,
+      targetFormat: task.targetFormat,
+      onProgress: (done, total) => {
+        task.doneSegs = done;
+        task.totalSegs = total;
+        task.progress = Math.round((done / total) * 100);
+
+        const fillEl = document.getElementById(`q-fill-${task.queueId}`);
+        const statusEl = document.getElementById(`q-status-${task.queueId}`);
+        if (fillEl) fillEl.style.width = `${task.progress}%`;
+        if (statusEl) statusEl.innerText = `Đang tải: ${done}/${total} (${task.progress}%)`;
+      },
+      onStatus: (msg) => {
+        const statusEl = document.getElementById(`q-status-${task.queueId}`);
+        if (statusEl && task.progress === 100) statusEl.innerText = msg;
+      }
+    });
+
+    const durationMs = Date.now() - task.startedAt;
+    const durationText = formatDuration(durationMs);
+    const completedAt = formatTimestamp(new Date());
+    const fullFileName = `${task.title}.${ext}`;
+    let chromeDownloadId = null;
+
+    if (savedDirHandle && appSettings.saveAs && window.showSaveFilePicker) {
+      const perm = await savedDirHandle.requestPermission({ mode: "readwrite" });
+      if (perm === "granted") {
+        const fileHandle = await window.showSaveFilePicker({
+          suggestedName: fullFileName,
+          startIn: savedDirHandle,
+          types: [{
+            description: ext.toUpperCase() + " Video",
+            accept: { [ext === "mp4" ? "video/mp4" : "video/mp2t"]: [`.${ext}`] }
+          }]
+        });
+        const writable = await fileHandle.createWritable();
+        await writable.write(blob);
+        await writable.close();
+      } else {
+        chromeDownloadId = await saveViaChromeDownloads(blob, fullFileName);
+      }
+    } else {
+      chromeDownloadId = await saveViaChromeDownloads(blob, fullFileName);
+    }
+
+    const hostname = task.stream.sourceUrl ? new URL(task.stream.sourceUrl).hostname : "local";
+
+    if (task.isRedownload) {
+      // Video tải xuống lại: Không lưu thêm bản ghi mới vào lịch sử, chỉ khôi phục trạng thái hiển thị của mục gốc (nếu có)
+      const existing = sessionCompleted.find(item => item.id === task.historyId);
+      if (existing) {
+        existing.inQueue = false;
+        existing.downloadId = chromeDownloadId || existing.downloadId;
+        existing.durationText = durationText;
+        existing.completedAt = completedAt;
+      }
+    } else {
+      // Video tải lần đầu: Lưu vào lịch sử Complete
+      sessionCompleted.unshift({
+        id: Date.now() + Math.random(),
+        title: task.title,
+        ext,
+        fullFileName,
+        hostname,
+        downloadId: chromeDownloadId,
+        targetFormat: task.targetFormat,
+        durationText,
+        completedAt,
+        inQueue: false,
+        stream: task.stream,
+        variant: task.variant
+      });
+    }
+
+    await saveSessionCompleted();
+
+    if (appSettings.notify) {
+      chrome.notifications.create({
+        type: "basic",
+        iconUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+        title: "Download completed",
+        message: `${fullFileName} (${durationText})`
+      });
+    }
+  } catch (err) {
+    console.error("Download Error:", err);
+    if (task.isRedownload && task.historyId) {
+      const existing = sessionCompleted.find(item => item.id === task.historyId);
+      if (existing) {
+        existing.inQueue = false;
+        await saveSessionCompleted();
+      }
+    }
+  }
+}
+
+function saveViaChromeDownloads(blob, fullFileName) {
+  return new Promise((resolve, reject) => {
+    const blobUrl = URL.createObjectURL(blob);
+    let sub = appSettings.subdir.replace(/^[\\/]+|[\\/]+$/g, "");
+    const finalPath = sub ? `${sub}/${fullFileName}` : fullFileName;
+
+    chrome.downloads.download({
+      url: blobUrl,
+      filename: finalPath,
+      saveAs: appSettings.saveAs
+    }, (downloadId) => {
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60000);
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      } else {
+        resolve(downloadId);
+      }
+    });
+  });
+}
+
+// --- HIỂN THỊ LỊCH SỬ COMPLETE & TẢI LẠI ---
+function renderCompletedList() {
+  const section = document.getElementById("completeSection");
+  const listEl = document.getElementById("completeList");
+
+  const visibleItems = sessionCompleted.filter(item => !item.inQueue);
+
+  if (visibleItems.length === 0) {
+    section.classList.add("hidden");
+    listEl.innerHTML = "";
+    return;
+  }
+
+  section.classList.remove("hidden");
+  listEl.innerHTML = "";
+
+  visibleItems.forEach((item) => {
+    const div = document.createElement("div");
+    div.className = "complete-card";
+    div.innerHTML = `
+      <div class="title-wrap">${item.fullFileName}</div>
+      <div class="meta-time-row">
+        <span>⏱ DL time: <b>${item.durationText || "--"}</b></span>
+        <span>⏱ At: <b>${item.completedAt || "--"}</b></span>
+      </div>
+      <div class="complete-actions">
+        <span class="domain-tag" title="${item.hostname}">🌐 ${item.hostname}</span>
+        <div class="action-btn-group">
+          <button class="round-icon-btn btn-redl" title="Add to reload queue">↻</button>
+          <button class="round-icon-btn btn-del" title="Remove from history">🗑</button>
+          <div class="green-split-pill">
+            <button class="btn-play" title="View video">▶ Play</button>
+            <button class="btn-folder" title="Show from folder">🗀</button>
+          </div>
+        </div>
+      </div>
+    `;
+    listEl.appendChild(div);
+
+    // Nhấn tải lại -> Nhảy từ lịch sử lên hàng chờ (Queue) và không tạo thêm bản ghi lịch sử mới
+    div.querySelector(".btn-redl").addEventListener("click", async () => {
+      item.inQueue = true;
+      await saveSessionCompleted();
+
+      enqueueDownload({
+        stream: item.stream,
+        variant: item.variant,
+        targetFormat: item.targetFormat,
+        title: item.title,
+        isRedownload: true,
+        historyId: item.id
+      });
+    });
+
+    div.querySelector(".btn-del").addEventListener("click", async () => {
+      sessionCompleted = sessionCompleted.filter(x => x.id !== item.id);
+      await saveSessionCompleted();
+    });
+
+    div.querySelector(".btn-play").addEventListener("click", () => {
+      if (item.downloadId) {
+        chrome.downloads.open(item.downloadId);
+      } else {
+        chrome.downloads.showDefaultFolder();
+      }
+    });
+
+    div.querySelector(".btn-folder").addEventListener("click", () => {
+      if (item.downloadId) {
+        chrome.downloads.show(item.downloadId);
+      } else {
+        chrome.downloads.showDefaultFolder();
+      }
+    });
+  });
+}
