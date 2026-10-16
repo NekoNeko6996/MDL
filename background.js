@@ -1,33 +1,47 @@
 // Bộ đệm lưu media riêng biệt cho từng tab: { [tabId]: Array<RawMedia> }
 const tabMediaMap = {};
+const tabUrlMap = {};
 
 chrome.action.onClicked.addListener((tab) => {
   chrome.sidePanel.open({ tabId: tab.id });
 });
 
-// Khi người dùng chuyển sang tab khác -> báo cho Side Panel đổi danh sách hiển thị
+// Khi người dùng chuyển sang tab khác -> báo cho Side Panel đổi tab hiển thị
 chrome.tabs.onActivated.addListener(({ tabId }) => {
-  notifySidePanel(tabId);
+  chrome.runtime.sendMessage({
+    type: "TAB_ACTIVATED",
+    tabId,
+    data: tabMediaMap[tabId] || []
+  }).catch(() => {});
 });
 
-// Khi tab tải lại trang hoặc cập nhật tiêu đề mới
+// Khi tab điều hướng SPA hoặc cập nhật tiêu đề mới
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status === "loading" && changeInfo.url) {
-    // Xóa cache cũ của tab khi điều hướng sang URL mới
-    tabMediaMap[tabId] = [];
-    notifySidePanel(tabId);
-  } else if (changeInfo.title && tabMediaMap[tabId]) {
-    // Cập nhật lại tiêu đề tab mới nhất cho các luồng đã bắt được
+  if (changeInfo.url) {
+    const cleanUrl = changeInfo.url.split("#")[0];
+    if (tabUrlMap[tabId] && tabUrlMap[tabId] !== cleanUrl) {
+      tabMediaMap[tabId] = [];
+      if (tab && tab.active) {
+        notifySidePanel(tabId);
+      }
+    }
+    tabUrlMap[tabId] = cleanUrl;
+  }
+
+  if (changeInfo.title && tabMediaMap[tabId] && tabMediaMap[tabId].length > 0) {
     tabMediaMap[tabId].forEach(item => {
       item.title = changeInfo.title;
     });
-    notifySidePanel(tabId);
+    if (tab && tab.active) {
+      notifySidePanel(tabId);
+    }
   }
 });
 
 // Giải phóng bộ đệm khi đóng tab
 chrome.tabs.onRemoved.addListener((tabId) => {
   delete tabMediaMap[tabId];
+  delete tabUrlMap[tabId];
 });
 
 function notifySidePanel(tabId) {
@@ -39,7 +53,18 @@ function notifySidePanel(tabId) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === "NEW_RAW_MEDIA") {
+  if (message.type === "RESET_TAB_MEDIA") {
+    const tabId = sender.tab ? sender.tab.id : null;
+    if (tabId && sender.frameId === 0) {
+      tabMediaMap[tabId] = [];
+      if (sender.tab.url) {
+        tabUrlMap[tabId] = sender.tab.url.split("#")[0];
+      }
+      if (sender.tab.active) {
+        notifySidePanel(tabId);
+      }
+    }
+  } else if (message.type === "NEW_RAW_MEDIA") {
     const tabId = sender.tab ? sender.tab.id : null;
     if (!tabId) return;
 
@@ -61,21 +86,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
     }
 
-    // Nếu dữ liệu thuộc về tab đang mở hiện tại thì cập nhật lên Side Panel
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      if (tabs[0] && tabs[0].id === tabId) {
-        notifySidePanel(tabId);
-      }
-    });
+    // Chỉ cập nhật lên Side Panel nếu dữ liệu thuộc về tab đang active
+    if (sender.tab && sender.tab.active) {
+      notifySidePanel(tabId);
+    }
   } else if (message.type === "GET_ACTIVE_TAB_MEDIA") {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
       const activeTabId = tabs[0] ? tabs[0].id : null;
       sendResponse({
         tabId: activeTabId,
         data: activeTabId ? (tabMediaMap[activeTabId] || []) : []
       });
     });
-    return true; // Giữ kênh message mở cho bất đồng bộ
+    return true;
   } else if (message.type === "CLEAR_ACTIVE_TAB_MEDIA") {
     const tabId = message.tabId;
     if (tabId && tabMediaMap[tabId]) {

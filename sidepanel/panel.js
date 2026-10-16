@@ -84,11 +84,20 @@ document.addEventListener("DOMContentLoaded", async () => {
   bindNavigationAndSettings();
   fetchActiveTabMedia();
 
-  // Lắng nghe khi người dùng chuyển tab hoặc có video mới trong tab hiện tại
+  // Lắng nghe khi người dùng chuyển tab trực tiếp từ Side Panel
+  chrome.tabs.onActivated.addListener(() => {
+    fetchActiveTabMedia();
+  });
+
+  // Lắng nghe dữ liệu từ background
   chrome.runtime.onMessage.addListener((message) => {
-    if (message.type === "TAB_MEDIA_UPDATED") {
+    if (message.type === "TAB_ACTIVATED") {
       currentTabId = message.tabId;
       updateFromRaw(message.data || []);
+    } else if (message.type === "TAB_MEDIA_UPDATED") {
+      if (message.tabId === currentTabId) {
+        updateFromRaw(message.data || []);
+      }
     }
   });
 
