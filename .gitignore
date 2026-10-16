@@ -1,1 +1,4 @@
-/sidepanel/plugins
+/sidepanel/plugins/*
+
+!/sidepanel/plugins/PLUGIN_GUIDE.md
+!/sidepanel/plugins/template.plugin.js
