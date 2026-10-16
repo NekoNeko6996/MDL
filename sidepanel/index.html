@@ -423,6 +423,81 @@
       margin: 5px 0;
     }
 
+    /* Thanh điều khiển hàng loạt trong Queue */
+    .queue-bulk-bar {
+      display: flex;
+      gap: 4px;
+      margin-bottom: 8px;
+    }
+    .btn-bulk-action {
+      flex: 1;
+      background: var(--bg-input);
+      color: var(--text-main);
+      border: 1px solid var(--border-color);
+      border-radius: 4px;
+      padding: 4px 6px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      white-space: nowrap;
+    }
+    .btn-bulk-action:hover:not(:disabled) {
+      background: #3b3e45;
+    }
+    .btn-bulk-action.danger:hover:not(:disabled) {
+      background: #c92a2a;
+      border-color: #c92a2a;
+      color: #fff;
+    }
+    .btn-bulk-action:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+
+    /* Nút điều khiển từng file trong Queue */
+    .queue-item-actions {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      flex-shrink: 0;
+    }
+
+    .btn-q-action {
+      background: var(--bg-input);
+      border: 1px solid var(--border-color);
+      color: var(--text-main);
+      border-radius: 4px;
+      width: 22px;
+      height: 22px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 11px;
+      padding: 0;
+      line-height: 1;
+    }
+    .btn-q-action:hover {
+      background: #3b3e45;
+      color: #fff;
+    }
+    .btn-q-action.cancel:hover {
+      background: #c92a2a;
+      border-color: #c92a2a;
+      color: #fff;
+    }
+    .queue-badge.paused {
+      color: #adb5bd;
+      border-color: #adb5bd;
+    }
+    .progress-bar-fill.paused {
+      background: var(--accent-amber);
+    }
+
     /* Thanh Footer dưới cùng */
     .bottom-bar {
       height: 38px;
@@ -465,6 +540,11 @@
     <!-- Hàng chờ tải (Giữ nguyên không đổi khi chuyển tab) -->
     <div id="queueSection" class="hidden">
       <div class="section-divider"><span>Downloading / Queue</span></div>
+      <div class="queue-bulk-bar">
+        <button id="pauseAllBtn" class="btn-bulk-action" title="Tạm dừng tất cả">⏸ Pause All</button>
+        <button id="resumeAllBtn" class="btn-bulk-action" title="Tiếp tục tất cả">▶ Resume All</button>
+        <button id="cancelAllBtn" class="btn-bulk-action danger" title="Hủy tất cả">✕ Cancel All</button>
+      </div>
       <div id="queueList"></div>
     </div>
 

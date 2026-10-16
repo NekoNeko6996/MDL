@@ -106,7 +106,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     downloadQueue.forEach((task) => {
       if (task.status === "downloading" && task.startedAt) {
         const el = document.getElementById(`q-timer-${task.queueId}`);
-        if (el) el.innerText = `⏱ ${formatDuration(Date.now() - task.startedAt)}`;
+        if (el) el.innerText = `⏱ ${formatDuration(getTaskElapsedMs(task))}`;
       }
     });
   }, 500);
@@ -230,6 +230,10 @@ function bindNavigationAndSettings() {
     sessionCompleted = [];
     await saveSessionCompleted();
   });
+
+  document.getElementById("pauseAllBtn").addEventListener("click", pauseAllTasks);
+  document.getElementById("resumeAllBtn").addEventListener("click", resumeAllTasks);
+  document.getElementById("cancelAllBtn").addEventListener("click", cancelAllTasks);
 }
 
 function fetchActiveTabMedia() {
@@ -267,7 +271,11 @@ function pickPreferredVariantIndex(variants) {
 // --- HIỂN THỊ DANH SÁCH VIDEO CỦA TAB HIỆN TẠI ---
 function renderStreams() {
   const container = document.getElementById("mediaContainer");
-  if (!standardizedList || standardizedList.length === 0) {
+  const visibleStreams = (standardizedList || []).filter(
+    stream => !downloadQueue.some(task => !task.isRedownload && task.stream.id === stream.id)
+  );
+
+  if (visibleStreams.length === 0) {
     container.innerHTML = `<div style="text-align:center; color:#909296; margin: 24px 0; font-size:12px;">No videos found in this tab.</div>`;
     return;
   }
@@ -275,7 +283,7 @@ function renderStreams() {
   container.innerHTML = "";
   const defaultFmt = appSettings.forceTs ? "ts" : "mp4";
 
-  standardizedList.forEach((stream, sIdx) => {
+  visibleStreams.forEach((stream, sIdx) => {
     const prefVIdx = pickPreferredVariantIndex(stream.variants);
     const activeVariant = stream.variants[prefVIdx] || stream.variants[0];
     const displayTitle = customTitles[stream.id] || stream.title || "Video";
@@ -394,6 +402,14 @@ function renderStreams() {
 }
 
 // --- QUẢN LÝ HÀNG CHỜ TẢI (QUEUE) CỐ ĐỊNH KHI CHUYỂN TAB ---
+function getTaskElapsedMs(task) {
+  let total = task.elapsedMs || 0;
+  if (task.status === "downloading" && task.startedAt) {
+    total += Date.now() - task.startedAt;
+  }
+  return total;
+}
+
 function enqueueDownload({ stream, variant, targetFormat, title, isRedownload = false, historyId = null }) {
   const queueId = "q_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
   downloadQueue.push({
@@ -404,15 +420,106 @@ function enqueueDownload({ stream, variant, targetFormat, title, isRedownload = 
     title,
     isRedownload,
     historyId,
-    status: "queued",
+    status: "queued", // "queued" | "downloading" | "paused" | "cancelled"
     progress: 0,
     doneSegs: 0,
     totalSegs: variant.segments.length,
-    startedAt: null
+    buffers: new Array(variant.segments.length),
+    elapsedMs: 0,
+    startedAt: null,
+    isRunning: false,
+    abortController: null
   });
 
+  renderStreams();
   renderQueue();
   processQueue();
+}
+
+function pauseTask(task) {
+  if (!task || task.status === "paused" || task.status === "cancelled") return;
+  if (task.status === "downloading" && task.startedAt) {
+    task.elapsedMs = (task.elapsedMs || 0) + (Date.now() - task.startedAt);
+    task.startedAt = null;
+  }
+  task.status = "paused";
+  if (task.abortController) {
+    task.abortController.abort();
+  }
+  renderQueue();
+}
+
+function resumeTask(task) {
+  if (!task || task.status !== "paused") return;
+  task.status = "queued";
+  renderQueue();
+  processQueue();
+}
+
+async function cancelTask(task) {
+  if (!task) return;
+  task.status = "cancelled";
+  if (task.abortController) {
+    task.abortController.abort();
+  }
+  task.buffers = null;
+  downloadQueue = downloadQueue.filter(t => t.queueId !== task.queueId);
+
+  if (task.isRedownload && task.historyId) {
+    const existing = sessionCompleted.find(item => item.id === task.historyId);
+    if (existing) {
+      existing.inQueue = false;
+      await saveSessionCompleted();
+    }
+  }
+
+  renderQueue();
+  renderStreams();
+  processQueue();
+}
+
+function pauseAllTasks() {
+  // Đổi trạng thái các task đang chờ sang paused trước để không tự động nhảy vào chạy khi task đang tải dừng
+  downloadQueue.forEach(t => {
+    if (t.status === "queued") t.status = "paused";
+  });
+  downloadQueue.forEach(t => {
+    if (t.status === "downloading") pauseTask(t);
+  });
+  renderQueue();
+}
+
+function resumeAllTasks() {
+  downloadQueue.forEach(t => {
+    if (t.status === "paused") t.status = "queued";
+  });
+  renderQueue();
+  processQueue();
+}
+
+async function cancelAllTasks() {
+  let hasRedownload = false;
+  downloadQueue.forEach(task => {
+    task.status = "cancelled";
+    if (task.abortController) {
+      task.abortController.abort();
+    }
+    task.buffers = null;
+    if (task.isRedownload && task.historyId) {
+      const existing = sessionCompleted.find(item => item.id === task.historyId);
+      if (existing) {
+        existing.inQueue = false;
+        hasRedownload = true;
+      }
+    }
+  });
+
+  downloadQueue = [];
+  if (hasRedownload) {
+    await saveSessionCompleted();
+  }
+  renderQueue();
+  renderStreams();
 }
 
 function renderQueue() {
@@ -428,14 +535,27 @@ function renderQueue() {
   section.classList.remove("hidden");
   listEl.innerHTML = "";
 
+  // Cập nhật trạng thái nút hàng loạt
+  const hasActiveOrQueued = downloadQueue.some(t => t.status === "downloading" || t.status === "queued");
+  const hasPaused = downloadQueue.some(t => t.status === "paused");
+  const pauseAllBtn = document.getElementById("pauseAllBtn");
+  const resumeAllBtn = document.getElementById("resumeAllBtn");
+  if (pauseAllBtn) pauseAllBtn.disabled = !hasActiveOrQueued;
+  if (resumeAllBtn) resumeAllBtn.disabled = !hasPaused;
+
   downloadQueue.forEach((task) => {
     const isDl = task.status === "downloading";
-    const statusLabel = isDl
-      ? `downloading: ${task.doneSegs}/${task.totalSegs} (${task.progress}%)`
-      : "in queue...";
-    const elapsedText = isDl && task.startedAt
-      ? `⏱ ${formatDuration(Date.now() - task.startedAt)}`
-      : "⏱ 0.0s";
+    const isPaused = task.status === "paused";
+
+    let statusLabel = "in queue...";
+    if (isDl) {
+      statusLabel = `Đang tải: ${task.doneSegs}/${task.totalSegs} (${task.progress}%)`;
+    } else if (isPaused) {
+      statusLabel = `Đã dừng: ${task.doneSegs}/${task.totalSegs} (${task.progress}%)`;
+    }
+
+    const elapsedText = `⏱ ${formatDuration(getTaskElapsedMs(task))}`;
+    const badgeText = isPaused ? "PAUSED" : (task.isRedownload ? "RE-DL" : "QUEUE");
 
     const card = document.createElement("div");
     card.className = "media-card in-queue";
@@ -448,8 +568,14 @@ function renderQueue() {
       <div class="card-body">
         <div class="title-row">
           <div class="title-wrap">
-            <span class="queue-badge">${task.isRedownload ? "RE-DL" : "QUEUE"}</span>
+            <span class="queue-badge ${isPaused ? "paused" : ""}">${badgeText}</span>
             <span>${task.title}.${task.targetFormat}</span>
+          </div>
+          <div class="queue-item-actions">
+            <button class="btn-q-action toggle-btn" title="${isPaused ? "Tiếp tục tải" : "Tạm dừng"}">
+              ${isPaused ? "▶" : "⏸"}
+            </button>
+            <button class="btn-q-action cancel cancel-btn" title="Hủy tải">✕</button>
           </div>
         </div>
         <div>
@@ -458,29 +584,49 @@ function renderQueue() {
             <span id="q-timer-${task.queueId}">${elapsedText}</span>
           </div>
           <div class="progress-track">
-            <div class="progress-bar-fill" id="q-fill-${task.queueId}" style="width: ${task.progress}%;"></div>
+            <div class="progress-bar-fill ${isPaused ? "paused" : ""}" id="q-fill-${task.queueId}" style="width: ${task.progress}%;"></div>
           </div>
         </div>
       </div>
     `;
     listEl.appendChild(card);
+
+    card.querySelector(".toggle-btn").addEventListener("click", () => {
+      if (task.status === "paused") {
+        resumeTask(task);
+      } else {
+        pauseTask(task);
+      }
+    });
+
+    card.querySelector(".cancel-btn").addEventListener("click", () => {
+      cancelTask(task);
+    });
   });
 }
 
 function processQueue() {
   while (activeDownloadsCount < appSettings.maxVideos) {
-    const nextTask = downloadQueue.find(t => t.status === "queued");
+    const nextTask = downloadQueue.find(t => t.status === "queued" && !t.isRunning);
     if (!nextTask) break;
 
     nextTask.status = "downloading";
+    nextTask.isRunning = true;
     nextTask.startedAt = Date.now();
+    nextTask.abortController = new AbortController();
     activeDownloadsCount++;
     renderQueue();
 
     runQueueTask(nextTask).finally(() => {
-      activeDownloadsCount--;
-      downloadQueue = downloadQueue.filter(t => t.queueId !== nextTask.queueId);
+      nextTask.isRunning = false;
+      activeDownloadsCount = Math.max(0, activeDownloadsCount - 1);
+
+      // Chỉ xóa khỏi hàng chờ nếu đã hoàn tất, bị hủy hoặc lỗi (giữ lại nếu đang tạm dừng hoặc vừa bấm tiếp tục)
+      if (nextTask.status !== "paused" && nextTask.status !== "queued") {
+        downloadQueue = downloadQueue.filter(t => t.queueId !== nextTask.queueId);
+      }
       renderQueue();
+      renderStreams();
       processQueue();
     });
   }
@@ -492,6 +638,8 @@ async function runQueueTask(task) {
       segments: task.variant.segments,
       concurrency: appSettings.concurrency,
       targetFormat: task.targetFormat,
+      existingBuffers: task.buffers,
+      signal: task.abortController.signal,
       onProgress: (done, total) => {
         task.doneSegs = done;
         task.totalSegs = total;
@@ -504,15 +652,18 @@ async function runQueueTask(task) {
       },
       onStatus: (msg) => {
         const statusEl = document.getElementById(`q-status-${task.queueId}`);
-        if (statusEl && task.progress === 100) statusEl.innerText = msg;
+        if (statusEl) statusEl.innerText = msg;
       }
     });
 
-    const durationMs = Date.now() - task.startedAt;
+    const durationMs = getTaskElapsedMs(task);
     const durationText = formatDuration(durationMs);
     const completedAt = formatTimestamp(new Date());
     const fullFileName = `${task.title}.${ext}`;
     let chromeDownloadId = null;
+
+    // Giải phóng bộ đệm phân đoạn sau khi đã đóng gói xong Blob
+    task.buffers = null;
 
     if (savedDirHandle && appSettings.saveAs && window.showSaveFilePicker) {
       const perm = await savedDirHandle.requestPermission({ mode: "readwrite" });
@@ -538,7 +689,6 @@ async function runQueueTask(task) {
     const hostname = task.stream.sourceUrl ? new URL(task.stream.sourceUrl).hostname : "local";
 
     if (task.isRedownload) {
-      // Video tải xuống lại: Không lưu thêm bản ghi mới vào lịch sử, chỉ khôi phục trạng thái hiển thị của mục gốc (nếu có)
       const existing = sessionCompleted.find(item => item.id === task.historyId);
       if (existing) {
         existing.inQueue = false;
@@ -547,7 +697,17 @@ async function runQueueTask(task) {
         existing.completedAt = completedAt;
       }
     } else {
-      // Video tải lần đầu: Lưu vào lịch sử Complete
+      chrome.runtime.sendMessage({
+        type: "REMOVE_RAW_ITEM",
+        tabId: task.stream.tabId || currentTabId,
+        blobUrl: task.stream.id
+      }, (updatedRaw) => {
+        if ((task.stream.tabId || currentTabId) === currentTabId) {
+          standardizedList = pluginManager.normalizeAll(updatedRaw || []);
+          renderStreams();
+        }
+      });
+
       sessionCompleted.unshift({
         id: Date.now() + Math.random(),
         title: task.title,
@@ -575,7 +735,13 @@ async function runQueueTask(task) {
       });
     }
   } catch (err) {
+    // Nếu do người dùng bấm Pause hoặc Cancel thì thoát êm, không báo lỗi
+    if (task.status === "paused" || task.status === "queued" || task.status === "cancelled" || err.name === "AbortError") {
+      return;
+    }
+
     console.error("Download Error:", err);
+    task.buffers = null;
     if (task.isRedownload && task.historyId) {
       const existing = sessionCompleted.find(item => item.id === task.historyId);
       if (existing) {
