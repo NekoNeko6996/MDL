@@ -1,9 +1,14 @@
 import { PluginManager } from "./core/plugin-manager.js";
 import { DownloadEngine } from "./core/download-engine.js";
-import { HaitenHlsPlugin } from "./plugins/haiten-hls.plugin.js";
 
+// import plugin
+import { HaitenHlsPlugin } from "./plugins/haiten-hls.plugin.js";
+import { BasicHLSPlugin } from "./plugins/basichls.plugin.js"
+
+// đăng ký plugin
 const pluginManager = new PluginManager();
 pluginManager.register(HaitenHlsPlugin);
+pluginManager.register(BasicHLSPlugin);
 
 let currentTabId = null;
 let standardizedList = [];   // Chỉ chứa video của Tab đang mở
@@ -643,6 +648,18 @@ function processQueue() {
 
 async function runQueueTask(task) {
   try {
+    // Nếu chọn độ phân giải từ Master Playlist mà trình phát chưa tải file .m3u8 con -> nạp ngay
+    if ((!task.variant.segments || task.variant.segments.length === 0) && task.variant.playlistUrl) {
+      const res = await fetch(task.variant.playlistUrl, { signal: task.abortController.signal });
+      if (!res.ok) throw new Error(`Không thể tải playlist: HTTP ${res.status}`);
+      const m3u8Text = await res.text();
+      const { segments, totalBytes } = BasicHLSPlugin.parseSegments(m3u8Text, task.variant.playlistUrl);
+      task.variant.segments = segments;
+      task.variant.sizeText = totalBytes > 0 ? `${Math.round(totalBytes / 1048576)}MB` : `${segments.length} segs`;
+      task.totalSegs = segments.length;
+      task.buffers = new Array(segments.length);
+    }
+
     const { blob, ext } = await DownloadEngine.downloadAndBuild({
       segments: task.variant.segments,
       concurrency: appSettings.concurrency,

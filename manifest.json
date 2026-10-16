@@ -9,7 +9,8 @@
     "downloads",
     "activeTab",
     "scripting",
-    "notifications"
+    "notifications",
+    "webRequest"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -24,7 +25,7 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["main-hook.js"],
+      "js": ["injected.hook.js"],
       "run_at": "document_start",
       "all_frames": true,
       "world": "MAIN"

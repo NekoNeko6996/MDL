@@ -15,6 +15,11 @@ export class PluginManager {
     const standardizedStreams = [];
     for (const plugin of this.plugins) {
       const matchedItems = rawList.filter(item => plugin.canHandle(item, rawList));
+
+      console.log("================ matchedItems ===============")
+      console.log(matchedItems);
+      console.log("================ ======= ===============")
+
       if (matchedItems.length > 0) {
         const results = plugin.process(matchedItems, rawList);
         standardizedStreams.push(...results);
