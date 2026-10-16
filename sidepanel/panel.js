@@ -19,9 +19,12 @@ const defaultSettings = {
   saveAs: true,
   maxVideos: 2,
   concurrency: 8,
+  segmentDelay: 0,
+  maxSpeed: 0,
   prefQuality: "highest",
   subdir: ""
 };
+
 let appSettings = { ...defaultSettings };
 
 // --- ĐỊNH DẠNG THỜI GIAN ---
@@ -122,6 +125,8 @@ async function loadSettings() {
   document.getElementById("setSaveAs").checked = appSettings.saveAs;
   document.getElementById("setMaxVideos").value = appSettings.maxVideos;
   document.getElementById("setConcurrency").value = appSettings.concurrency;
+  document.getElementById("setSegmentDelay").value = appSettings.segmentDelay;
+  document.getElementById("setMaxSpeed").value = appSettings.maxSpeed;
   document.getElementById("setSubdir").value = appSettings.subdir;
 
   const radio = document.querySelector(`input[name="prefQuality"][value="${appSettings.prefQuality}"]`);
@@ -134,6 +139,8 @@ function saveSettings() {
   appSettings.saveAs = document.getElementById("setSaveAs").checked;
   appSettings.maxVideos = Math.max(1, parseInt(document.getElementById("setMaxVideos").value, 10) || 2);
   appSettings.concurrency = Math.max(1, parseInt(document.getElementById("setConcurrency").value, 10) || 8);
+  appSettings.segmentDelay = Math.max(0, parseInt(document.getElementById("setSegmentDelay").value, 10) || 0);
+  appSettings.maxSpeed = Math.max(0, parseFloat(document.getElementById("setMaxSpeed").value) || 0);
   appSettings.subdir = document.getElementById("setSubdir").value.trim();
 
   const checkedRadio = document.querySelector('input[name="prefQuality"]:checked');
@@ -182,9 +189,10 @@ function bindNavigationAndSettings() {
     toggleSettingsBtn.classList.remove("active");
   });
 
-  ["setForceTs", "setNotify", "setSaveAs", "setMaxVideos", "setConcurrency", "setSubdir"].forEach(id => {
+  ["setForceTs", "setNotify", "setSaveAs", "setMaxVideos", "setConcurrency", "setSegmentDelay", "setMaxSpeed", "setSubdir"].forEach(id => {
     document.getElementById(id).addEventListener("change", saveSettings);
   });
+
   document.querySelectorAll('input[name="prefQuality"]').forEach(r => {
     r.addEventListener("change", saveSettings);
   });
@@ -378,7 +386,8 @@ function renderStreams() {
       chrome.runtime.sendMessage({
         type: "REMOVE_RAW_ITEM",
         tabId: currentTabId,
-        blobUrl: stream.id
+        blobUrl: stream.id,
+        blobUrls: stream.rawBlobUrls || [stream.id]
       }, (updatedRaw) => {
         updateFromRaw(updatedRaw || []);
       });
@@ -637,6 +646,8 @@ async function runQueueTask(task) {
     const { blob, ext } = await DownloadEngine.downloadAndBuild({
       segments: task.variant.segments,
       concurrency: appSettings.concurrency,
+      segmentDelay: appSettings.segmentDelay,
+      maxSpeed: appSettings.maxSpeed,
       targetFormat: task.targetFormat,
       existingBuffers: task.buffers,
       signal: task.abortController.signal,
@@ -700,7 +711,8 @@ async function runQueueTask(task) {
       chrome.runtime.sendMessage({
         type: "REMOVE_RAW_ITEM",
         tabId: task.stream.tabId || currentTabId,
-        blobUrl: task.stream.id
+        blobUrl: task.stream.id,
+        blobUrls: task.stream.rawBlobUrls || [task.stream.id]
       }, (updatedRaw) => {
         if ((task.stream.tabId || currentTabId) === currentTabId) {
           standardizedList = pluginManager.normalizeAll(updatedRaw || []);

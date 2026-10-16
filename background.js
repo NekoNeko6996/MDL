@@ -106,9 +106,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     sendResponse({ ok: true });
   } else if (message.type === "REMOVE_RAW_ITEM") {
-    const { tabId, blobUrl } = message;
+    const { tabId, blobUrl, blobUrls } = message;
     if (tabId && tabMediaMap[tabId]) {
-      tabMediaMap[tabId] = tabMediaMap[tabId].filter(item => item.blobUrl !== blobUrl);
+      const urlsToRemove = new Set(Array.isArray(blobUrls) ? blobUrls : (blobUrl ? [blobUrl] : []));
+      tabMediaMap[tabId] = tabMediaMap[tabId].filter(item => !urlsToRemove.has(item.blobUrl));
       sendResponse(tabMediaMap[tabId]);
     } else {
       sendResponse([]);

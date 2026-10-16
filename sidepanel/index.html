@@ -601,6 +601,16 @@
         <span>Max segment threads per video</span>
       </div>
 
+      <div class="number-row">
+        <input type="number" id="setSegmentDelay" class="dark-input" style="width: 65px;" min="0" max="60000" step="50" value="0">
+        <span>Delay between segments (ms)</span>
+      </div>
+
+      <div class="number-row">
+        <input type="number" id="setMaxSpeed" class="dark-input" style="width: 65px;" min="0" max="1000" step="0.5" value="0">
+        <span>Max speed (MB/s, 0 = Unlimited)</span>
+      </div>
+
       <h4>Preferred video quality</h4>
       <label class="form-check">
         <input type="radio" name="prefQuality" value="highest" checked>
