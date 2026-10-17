@@ -10,7 +10,6 @@
   * Chặn bắt danh sách phát `#EXTM3U` trực tiếp từ `window.fetch`, `XMLHttpRequest` và `URL.createObjectURL` (Blob URL) ngay tại thời điểm `document_start`.
   * Quản lý danh sách video độc lập cho từng Tab, tự động cập nhật giao diện khi chuyển Tab hoặc tải lại trang.
 * **Kiến trúc đa Plugin linh hoạt:**
-  * **HaitenHlsPlugin (`HLS`):** Xử lý các luồng HLS tạo qua `blob:` URL, hỗ trợ phân đoạn `#EXT-X-BYTERANGE` và tự động lọc bỏ header ảnh ngụy trang (`.png`).
   * **BasicHLSPlugin (`HLS-B`):** Xử lý các luồng HLS tiêu chuẩn qua giao thức `http/https` với đường dẫn phân đoạn `.ts` tương đối hoặc tuyệt đối, tự động gom nhóm các độ phân giải (`1080p`, `720p`, `480p`, `360p`...).
 * **Tải đa luồng & Kiểm soát hàng chờ (Download Queue):**
   * Tải đồng thời nhiều video và chia luồng tải phân đoạn (segment workers).
@@ -44,8 +43,6 @@ MDL/
     │   ├── download-engine.js    # Bộ tải đa luồng, giới hạn tốc độ, xử lý 429 và đóng gói MP4/TS
     │   └── plugin-manager.js     # Bộ đăng ký và chuẩn hóa dữ liệu từ các Plugin
     └── plugins/
-        ├── haiten-hls.plugin.js  # Plugin xử lý luồng Blob HLS & Byte-Range
-        ├── basichls.plugin.js    # Plugin xử lý luồng HTTP/HTTPS M3U8 tiêu chuẩn
         └── template.plugin.js    # Khung mẫu phát triển Plugin mới
 ```
 
