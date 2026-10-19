@@ -398,16 +398,20 @@ function renderStreams() {
       });
     });
 
-    card.querySelector(`#dl-btn-${sIdx}`).addEventListener("click", () => {
+    card.querySelector(`#dl-btn-${sIdx}`).addEventListener("click", async () => {
       const vIdx = parseInt(varSelect.value, 10);
       const targetFormat = fmtSelect.value;
       const finalTitle = customTitles[stream.id] || stream.title || "Video";
+
+      const fileHandle = await prepareFileHandleOnGesture(finalTitle, targetFormat);
+      if (fileHandle === false) return; // Hủy thao tác nếu người dùng đóng hộp thoại Save As
 
       enqueueDownload({
         stream,
         variant: stream.variants[vIdx],
         targetFormat,
         title: finalTitle,
+        fileHandle,
         isRedownload: false,
         historyId: null
       });
@@ -424,7 +428,43 @@ function getTaskElapsedMs(task) {
   return total;
 }
 
-function enqueueDownload({ stream, variant, targetFormat, title, isRedownload = false, historyId = null }) {
+async function prepareFileHandleOnGesture(title, ext) {
+  if (!savedDirHandle) return null;
+
+  try {
+    let perm = await savedDirHandle.queryPermission({ mode: "readwrite" });
+    if (perm !== "granted") {
+      perm = await savedDirHandle.requestPermission({ mode: "readwrite" });
+    }
+    if (perm !== "granted") return null;
+
+    const fullFileName = `${title}.${ext}`;
+
+    // Nếu bật Save As: Mở hộp thoại chọn file ngay lúc vừa click (còn User Gesture)
+    if (appSettings.saveAs && window.showSaveFilePicker) {
+      try {
+        return await window.showSaveFilePicker({
+          suggestedName: fullFileName,
+          startIn: savedDirHandle,
+          types: [{
+            description: ext.toUpperCase() + " Video",
+            accept: { [ext === "mp4" ? "video/mp4" : "video/mp2t"]: [`.${ext}`] }
+          }]
+        });
+      } catch (err) {
+        if (err.name === "AbortError") return false; // Người dùng bấm Cancel hộp thoại
+        return null;
+      }
+    }
+
+    // Nếu tắt Save As nhưng có savedDirHandle: Tạo thẳng file trong thư mục mặc định
+    return await savedDirHandle.getFileHandle(fullFileName, { create: true });
+  } catch (_) {
+    return null;
+  }
+}
+
+function enqueueDownload({ stream, variant, targetFormat, title, fileHandle = null, isRedownload = false, historyId = null }) {
   const queueId = "q_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
   downloadQueue.push({
     queueId,
@@ -432,6 +472,7 @@ function enqueueDownload({ stream, variant, targetFormat, title, isRedownload = 
     variant,
     targetFormat,
     title,
+    fileHandle,
     isRedownload,
     historyId,
     status: "queued", // "queued" | "downloading" | "paused" | "cancelled"
@@ -693,23 +734,16 @@ async function runQueueTask(task) {
     // Giải phóng bộ đệm phân đoạn sau khi đã đóng gói xong Blob
     task.buffers = null;
 
-    if (savedDirHandle && appSettings.saveAs && window.showSaveFilePicker) {
-      const perm = await savedDirHandle.requestPermission({ mode: "readwrite" });
-      if (perm === "granted") {
-        const fileHandle = await window.showSaveFilePicker({
-          suggestedName: fullFileName,
-          startIn: savedDirHandle,
-          types: [{
-            description: ext.toUpperCase() + " Video",
-            accept: { [ext === "mp4" ? "video/mp4" : "video/mp2t"]: [`.${ext}`] }
-          }]
-        });
-        const writable = await fileHandle.createWritable();
+    if (task.fileHandle) {
+      try {
+        const writable = await task.fileHandle.createWritable();
         await writable.write(blob);
         await writable.close();
-      } else {
+      } catch (fsErr) {
+        console.warn("Ghi qua FileHandle thất bại, chuyển sang Chrome Downloads:", fsErr);
         chromeDownloadId = await saveViaChromeDownloads(blob, fullFileName);
       }
+      task.fileHandle = null;
     } else {
       chromeDownloadId = await saveViaChromeDownloads(blob, fullFileName);
     }
@@ -843,6 +877,9 @@ function renderCompletedList() {
 
     // Nhấn tải lại -> Nhảy từ lịch sử lên hàng chờ (Queue) và không tạo thêm bản ghi lịch sử mới
     div.querySelector(".btn-redl").addEventListener("click", async () => {
+      const fileHandle = await prepareFileHandleOnGesture(item.title, item.targetFormat);
+      if (fileHandle === false) return;
+
       item.inQueue = true;
       await saveSessionCompleted();
 
@@ -851,6 +888,7 @@ function renderCompletedList() {
         variant: item.variant,
         targetFormat: item.targetFormat,
         title: item.title,
+        fileHandle,
         isRedownload: true,
         historyId: item.id
       });
